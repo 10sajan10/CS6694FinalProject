@@ -44,27 +44,14 @@ docker compose down -v     # removes data volume too
 
 ## Sharing the Database Image (437MB .tar)
 
-Because the resulting `lro_postgres_image.tar` is larger than GitHub's 100MB file limit, you cannot push it directly to the repository codebase.
+Because the resulting `lro_postgres_image.tar` is larger than GitHub's 100MB file limit, it has been uploaded to Google Drive.
 
-Instead, please use one of these methods to share the image:
-
-### Option 1: GitHub Releases (Recommended)
-1. Go to your repository on GitHub.
-2. Click **Releases** on the right side, then **Draft a new release**.
-3. Create a tag (e.g., `v1.0`).
-4. Drag and drop your `lro_postgres_image.tar` into the "Attach binaries" box at the bottom.
-5. Click **Publish release**.
-
-*(Other team members can then download the `.tar` file directly from the GitHub Releases page).*
-
-### Option 2: Cloud Storage
-1. Upload the `.tar` file to a shared Google Drive, OneDrive, or Dropbox folder.
-2. Share the download link with your team members.
+📥 **Download the Database Image:** [lro_postgres_image.tar (Google Drive)](https://drive.google.com/file/d/104fkVMOSoPA-O5F7ZxqdQ3L6YrLpBtR_/view?usp=sharing)
 
 ---
 
 ### Import (Receiver's End)
-Once a team member downloads the `.tar` file, they can load it locally:
+Once you download the(`.tar`) file from the link above to your local project directory, load it:
 ```bash
 docker load -i lro_postgres_image.tar
 docker compose up -d
