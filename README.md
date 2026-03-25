@@ -68,32 +68,31 @@ docker compose up -d --build
 
 ---
 
-## Database Normalization (ETL)
-
-After ingesting raw CSV data into the `staging` table using `ingest_csv.py`, you can normalize it into the structured schema:
-
-1. **Run the Normalization Script**:
-   ```bash
-   docker exec postgres psql -U admin -d database -f /normalize_data.sql
-   ```
-2. **Verify the Results**:
-   Open the `explore_staging.ipynb` notebook. The second section ("2. Normalized Data Verification") contains cells to count and preview the data in the structured tables (`site`, `variable`, `datastream`, etc.).
-
 ---
 
-## Data Exploration (Jupyter Notebook)
+## The Data Pipeline (ETL)
 
-To explore the ingested data:
-1. Ensure your container is running: `docker compose up -d`
-2. Install notebook dependencies:
-   ```bash
-   pip install pandas sqlalchemy psycopg2-binary notebook
-   ```
-3. Launch Jupyter:
-   ```bash
-   jupyter notebook explore_staging.ipynb
-   ```
-4. Run the cells to see the first 10 rows of the staging table.
+This project follows a 3-step pipeline to ingest raw CSV data, normalize it into a relational database, and explore it.
+
+### Step 1: Ingest Raw CSV Data
+Run the python script to parse metadata headers from the LRO CSV files and batch-insert the data into the temporary `staging` table.
+```bash
+python ingest_csv.py
+```
+*(Make sure the CSV files are in the `Data/` folder).*
+
+### Step 2: Normalize the Database
+Execute the SQL script to move the flat staging data into structured tables (`site`, `variable`, `datastream`, etc.).
+```bash
+docker exec -it postgres psql -U admin -d database -f /normalize_data.sql
+```
+
+### Step 3: Explore the Data
+Launch the Jupyter Notebook to verify the row counts and preview the normalized data.
+```bash
+jupyter notebook explore_staging.ipynb
+```
+*(Make sure to run `pip install pandas sqlalchemy psycopg2-binary notebook` first if you haven't).*
 
 ---
 
