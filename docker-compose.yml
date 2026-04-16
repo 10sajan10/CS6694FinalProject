@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   postgres:
-    build: .
+    image: lro_postgres_image:latest
     container_name: postgres
     environment:
       POSTGRES_USER: admin
