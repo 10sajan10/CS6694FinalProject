@@ -16,14 +16,14 @@ from datetime import datetime
 # -------------------------------------------------------------------
 DB_CONFIG = {
     "host": "localhost",
-    "port": 5433,
+    "port": int(os.environ.get("DB_PORT", 5433)),
     "dbname": "database",
     "user": "admin",
     "password": "password",
 }
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data")
-BATCH_SIZE = 5000  # rows per INSERT batch
+BATCH_SIZE = 50000  # rows per INSERT batch
 
 
 def parse_metadata(header_lines: list[str]) -> dict:

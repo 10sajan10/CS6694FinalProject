@@ -100,6 +100,7 @@ LEFT JOIN owner o ON s.owner_name = o.name
 LEFT JOIN qualifier q ON s.qualifier_code = q.qualifier_code
 LEFT JOIN processing_level pl ON s.processing_level_code = pl.code;
 
+DROP TABLE staging;
 COMMIT;
 
 -- Verification counts
@@ -114,3 +115,5 @@ UNION ALL
 SELECT 'variable', count(*) FROM variable
 UNION ALL
 SELECT 'datastream', count(*) FROM datastream;
+
+DROP TABLE staging;
