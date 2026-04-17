@@ -4,6 +4,7 @@ FROM postgres:16
 ENV POSTGRES_USER=admin
 ENV POSTGRES_PASSWORD=password
 ENV POSTGRES_DB=database
+ENV PGDATA=/pgdata
 
 # Copy initialization scripts (run in alphabetical order on first start)
 COPY init-scripts/ /docker-entrypoint-initdb.d/
