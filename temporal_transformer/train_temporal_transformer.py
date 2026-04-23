@@ -1,0 +1,623 @@
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import math
+import random
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytorch_lightning as pl
+import torch
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+
+SEASON_NAMES = {
+    0: "winter",
+    1: "spring",
+    2: "summer",
+    3: "fall",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    project_root = Path(__file__).resolve().parents[1]
+    default_pattern = str(project_root / "streamflow_parquet_v2" / "*precip24avg*.parquet")
+
+    parser = argparse.ArgumentParser(
+        description="Train per-site temporal transformer models on multihorizon streamflow parquet data."
+    )
+    parser.add_argument(
+        "--parquet-pattern",
+        default=default_pattern,
+        help="Glob pattern for parquet inputs.",
+    )
+    parser.add_argument(
+        "--output-root",
+        default=str(project_root),
+        help="Project root where models/ and metrics_by_season.csv will be written.",
+    )
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--max-epochs", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=7)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--hidden-dim", type=int, default=96)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
+    return parser.parse_args()
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    pl.seed_everything(seed, workers=True)
+
+
+def month_to_season_name(month: int) -> str:
+    if month in (12, 1, 2):
+        return "winter"
+    if month in (3, 4, 5):
+        return "spring"
+    if month in (6, 7, 8):
+        return "summer"
+    return "fall"
+
+
+def extract_lag_number(column_name: str) -> int:
+    match = re.search(r"t-(\d+)$", column_name)
+    if not match:
+        raise ValueError(f"Could not parse lag number from column: {column_name}")
+    return int(match.group(1))
+
+
+def extract_horizon_number(column_name: str) -> int:
+    match = re.search(r"t\+(\d+)$", column_name)
+    if not match:
+        raise ValueError(f"Could not parse horizon number from column: {column_name}")
+    return int(match.group(1))
+
+
+def load_parquet_frames(pattern: str) -> pd.DataFrame:
+    paths = sorted(Path(p) for p in glob.glob(pattern))
+
+    if not paths:
+        raise FileNotFoundError(f"No parquet files matched pattern: {pattern}")
+
+    frames = []
+    for path in paths:
+        print(f"Loading parquet: {path}")
+        df = pd.read_parquet(path)
+        df["source_path"] = str(path)
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    print(f"Loaded {len(combined):,} total rows from {len(paths)} parquet file(s)")
+    return combined
+
+
+def parse_timestamp_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for column in ["history_end_time", "forecast_start_time", "forecast_end_time"]:
+        if column in out.columns:
+            out[column] = pd.to_datetime(out[column], errors="coerce")
+    bad_rows = out["forecast_end_time"].isna().sum()
+    if bad_rows:
+        raise ValueError(f"Found {bad_rows} rows with invalid forecast_end_time timestamps.")
+    return out
+
+
+def deduplicate_site_rows(df: pd.DataFrame) -> pd.DataFrame:
+    sort_columns = ["site_id", "forecast_start_time", "source_path"]
+    available_sort = [col for col in sort_columns if col in df.columns]
+    deduped = (
+        df.sort_values(available_sort)
+        .drop_duplicates(subset=["site_id", "forecast_start_time"], keep="last")
+        .reset_index(drop=True)
+    )
+    dropped = len(df) - len(deduped)
+    if dropped:
+        print(f"Dropped {dropped:,} duplicate site/timestamp rows, keeping the latest file version.")
+    return deduped
+
+
+def infer_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    lag_cols = sorted(
+        [col for col in df.columns if col.startswith("discharge_t-")],
+        key=extract_lag_number,
+        reverse=True,
+    )
+    target_cols = sorted(
+        [col for col in df.columns if col.startswith("target_discharge_t+")],
+        key=extract_horizon_number,
+    )
+
+    dropped_feature_columns = {
+        "site_id",
+        "stride",
+        "sample_stride_hours",
+        "history_end_time",
+        "forecast_start_time",
+        "forecast_end_time",
+        "source_path",
+    }
+    static_cols = [
+        col
+        for col in df.columns
+        if col not in dropped_feature_columns and col not in lag_cols and col not in target_cols
+    ]
+    return lag_cols, target_cols, static_cols
+
+
+def add_fixed_season_dummies(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "season" in out.columns:
+        season_series = out["season"].map(SEASON_NAMES).fillna("unknown")
+        dummies = pd.get_dummies(season_series, prefix="season")
+        for name in ["season_winter", "season_spring", "season_summer", "season_fall"]:
+            if name not in dummies.columns:
+                dummies[name] = 0
+        dummies = dummies[["season_winter", "season_spring", "season_summer", "season_fall"]]
+        out = pd.concat([out.drop(columns=["season"]), dummies], axis=1)
+    return out
+
+
+def build_static_features(df: pd.DataFrame, static_cols: list[str]) -> pd.DataFrame:
+    static_df = df[static_cols].copy()
+    static_df = add_fixed_season_dummies(static_df)
+    return static_df
+
+
+def trailing_one_year_split(site_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp, pd.Timestamp]:
+    latest_target_timestamp = pd.Timestamp(site_df["forecast_end_time"].max())
+    validation_start = latest_target_timestamp - pd.DateOffset(years=1) + pd.Timedelta(hours=1)
+
+    train_df = site_df.loc[site_df["forecast_end_time"] < validation_start].copy()
+    valid_df = site_df.loc[site_df["forecast_start_time"] >= validation_start].copy()
+
+    if train_df.empty or valid_df.empty:
+        raise ValueError(
+            "Time-based split produced an empty train or validation frame. "
+            f"validation_start={validation_start}"
+        )
+
+    return train_df, valid_df, validation_start, latest_target_timestamp
+
+
+def fit_scalers(
+    train_df: pd.DataFrame,
+    lag_cols: list[str],
+    static_cols: list[str],
+    target_cols: list[str],
+) -> tuple[StandardScaler, StandardScaler, StandardScaler, list[str]]:
+    static_train = build_static_features(train_df, static_cols)
+    static_train = static_train.apply(pd.to_numeric, errors="coerce")
+    static_train = static_train.fillna(static_train.median(numeric_only=True))
+    static_train = static_train.fillna(0.0)
+    static_feature_cols = static_train.columns.tolist()
+
+    lag_scaler = StandardScaler()
+    lag_scaler.fit(train_df[lag_cols].to_numpy(dtype=np.float32).reshape(-1, 1))
+
+    static_scaler = StandardScaler()
+    static_scaler.fit(static_train.to_numpy(dtype=np.float32))
+
+    target_scaler = StandardScaler()
+    target_scaler.fit(train_df[target_cols].to_numpy(dtype=np.float32).reshape(-1, 1))
+
+    return lag_scaler, static_scaler, target_scaler, static_feature_cols
+
+
+def transform_frame(
+    df: pd.DataFrame,
+    lag_cols: list[str],
+    target_cols: list[str],
+    static_cols: list[str],
+    static_feature_cols: list[str],
+    lag_scaler: StandardScaler,
+    static_scaler: StandardScaler,
+    target_scaler: StandardScaler,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    lag_values = df[lag_cols].to_numpy(dtype=np.float32)
+    lag_values = lag_scaler.transform(lag_values.reshape(-1, 1)).reshape(lag_values.shape)
+
+    static_df = build_static_features(df, static_cols)
+    static_df = static_df.apply(pd.to_numeric, errors="coerce")
+    for column in static_feature_cols:
+        if column not in static_df.columns:
+            static_df[column] = 0.0
+    static_df = static_df[static_feature_cols]
+    static_df = static_df.fillna(0.0)
+    static_values = static_scaler.transform(static_df.to_numpy(dtype=np.float32))
+
+    target_values = df[target_cols].to_numpy(dtype=np.float32)
+    target_values = target_scaler.transform(target_values.reshape(-1, 1)).reshape(target_values.shape)
+
+    return lag_values, static_values, target_values
+
+
+class StreamflowSequenceDataset(Dataset):
+    def __init__(self, lag_values: np.ndarray, static_values: np.ndarray, targets: np.ndarray):
+        self.lag_values = lag_values.astype(np.float32)
+        self.static_values = static_values.astype(np.float32)
+        self.targets = targets.astype(np.float32)
+
+    def __len__(self) -> int:
+        return len(self.targets)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        lag_sequence = self.lag_values[index][:, None]
+        repeated_static = np.repeat(self.static_values[index][None, :], lag_sequence.shape[0], axis=0)
+        sequence = np.concatenate([lag_sequence, repeated_static], axis=1)
+
+        return (
+            torch.tensor(sequence, dtype=torch.float32),
+            torch.tensor(self.targets[index], dtype=torch.float32),
+        )
+
+
+class TemporalTransformer(pl.LightningModule):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float,
+        horizon: int,
+        learning_rate: float,
+        seq_len: int,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.position_embedding = nn.Parameter(torch.zeros(1, seq_len, hidden_dim))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, horizon),
+        )
+        self.loss_fn = nn.MSELoss()
+
+    def forward(self, sequence: torch.Tensor) -> torch.Tensor:
+        hidden = self.input_projection(sequence) + self.position_embedding[:, : sequence.shape[1], :]
+        encoded = self.encoder(hidden)
+        pooled = encoded[:, -1, :]
+        return self.head(pooled)
+
+    def training_step(self, batch, batch_idx: int) -> torch.Tensor:
+        sequence, target = batch
+        prediction = self(sequence)
+        loss = self.loss_fn(prediction, target)
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx: int) -> torch.Tensor:
+        sequence, target = batch
+        prediction = self(sequence)
+        loss = self.loss_fn(prediction, target)
+        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=3,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            },
+        }
+
+
+def make_dataloader(dataset: Dataset, batch_size: int, shuffle: bool, num_workers: int) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def inverse_scale_targets(values: np.ndarray, scaler: StandardScaler) -> np.ndarray:
+    original_shape = values.shape
+    restored = scaler.inverse_transform(values.reshape(-1, 1)).reshape(original_shape)
+    return restored
+
+
+def predict_batches(model: nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
+    model.eval()
+    outputs = []
+    with torch.no_grad():
+        for sequences, _ in loader:
+            sequences = sequences.to(device)
+            predictions = model(sequences).detach().cpu().numpy()
+            outputs.append(predictions)
+    return np.concatenate(outputs, axis=0)
+
+
+def compute_overall_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> tuple[float, float]:
+    rmse = math.sqrt(mean_squared_error(y_true.reshape(-1), y_pred.reshape(-1)))
+    mae = mean_absolute_error(y_true.reshape(-1), y_pred.reshape(-1))
+    return float(rmse), float(mae)
+
+
+def expand_predictions_by_target_timestamp(
+    site_id: int,
+    valid_df: pd.DataFrame,
+    target_cols: list[str],
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> pd.DataFrame:
+    records: list[dict] = []
+    horizon_steps = [extract_horizon_number(col) for col in target_cols]
+
+    for row_idx, (_, row) in enumerate(valid_df.reset_index(drop=True).iterrows()):
+        forecast_start = pd.Timestamp(row["forecast_start_time"])
+        for step_idx, horizon_step in enumerate(horizon_steps):
+            target_timestamp = forecast_start + pd.Timedelta(hours=horizon_step - 1)
+            records.append(
+                {
+                    "site_id": int(site_id),
+                    "target_timestamp": target_timestamp,
+                    "season": month_to_season_name(int(target_timestamp.month)),
+                    "y_true": float(y_true[row_idx, step_idx]),
+                    "y_pred": float(y_pred[row_idx, step_idx]),
+                }
+            )
+    return pd.DataFrame.from_records(records)
+
+
+def aggregate_season_metrics(expanded_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (site_id, season), group in expanded_df.groupby(["site_id", "season"], sort=True):
+        rmse = math.sqrt(mean_squared_error(group["y_true"], group["y_pred"]))
+        mae = mean_absolute_error(group["y_true"], group["y_pred"])
+        rows.append(
+            {
+                "site_id": int(site_id),
+                "season": season,
+                "rmse": float(rmse),
+                "mae": float(mae),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["site_id", "season"]).reset_index(drop=True)
+
+
+def train_one_site(
+    site_df: pd.DataFrame,
+    args: argparse.Namespace,
+    output_root: Path,
+) -> tuple[pd.DataFrame, dict]:
+    site_id = int(site_df["site_id"].iloc[0])
+    print(f"\n{'=' * 80}")
+    print(f"Training transformer for site_id={site_id}")
+    print(f"{'=' * 80}")
+
+    lag_cols, target_cols, static_cols = infer_columns(site_df)
+    if not lag_cols or not target_cols:
+        raise ValueError(f"Site {site_id} is missing lag or target columns.")
+
+    train_df, valid_df, validation_start, validation_end = trailing_one_year_split(site_df)
+    print(
+        f"Site {site_id}: train rows={len(train_df):,}, validation rows={len(valid_df):,}, "
+        f"validation window={validation_start} to {validation_end}"
+    )
+
+    lag_scaler, static_scaler, target_scaler, static_feature_cols = fit_scalers(
+        train_df,
+        lag_cols,
+        static_cols,
+        target_cols,
+    )
+
+    train_lags, train_static, train_targets = transform_frame(
+        train_df,
+        lag_cols,
+        target_cols,
+        static_cols,
+        static_feature_cols,
+        lag_scaler,
+        static_scaler,
+        target_scaler,
+    )
+    valid_lags, valid_static, valid_targets = transform_frame(
+        valid_df,
+        lag_cols,
+        target_cols,
+        static_cols,
+        static_feature_cols,
+        lag_scaler,
+        static_scaler,
+        target_scaler,
+    )
+
+    train_dataset = StreamflowSequenceDataset(train_lags, train_static, train_targets)
+    valid_dataset = StreamflowSequenceDataset(valid_lags, valid_static, valid_targets)
+    train_loader = make_dataloader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers)
+    valid_loader = make_dataloader(valid_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    input_dim = train_dataset[0][0].shape[-1]
+    horizon = len(target_cols)
+    seq_len = len(lag_cols)
+    site_model_dir = output_root / "models" / str(site_id)
+    site_model_dir.mkdir(parents=True, exist_ok=True)
+
+    model = TemporalTransformer(
+        input_dim=input_dim,
+        hidden_dim=args.hidden_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        horizon=horizon,
+        learning_rate=args.learning_rate,
+        seq_len=seq_len,
+    )
+
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=site_model_dir,
+        filename="lightning-best",
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+    )
+    early_stopping = EarlyStopping(
+        monitor="val_loss",
+        mode="min",
+        patience=args.patience,
+    )
+
+    trainer = pl.Trainer(
+        accelerator="auto",
+        devices=1,
+        max_epochs=args.max_epochs,
+        callbacks=[checkpoint_callback, early_stopping],
+        deterministic=True,
+        enable_progress_bar=True,
+        log_every_n_steps=10,
+    )
+
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
+
+    best_ckpt_path = checkpoint_callback.best_model_path
+    if best_ckpt_path:
+        print(f"Site {site_id}: reloading best checkpoint from {best_ckpt_path}")
+        best_model = TemporalTransformer.load_from_checkpoint(best_ckpt_path)
+    else:
+        print(f"Site {site_id}: no checkpoint found, falling back to in-memory model")
+        best_model = model
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    best_model = best_model.to(device)
+
+    scaled_predictions = predict_batches(best_model, valid_loader, device=device)
+    scaled_truth = valid_targets
+
+    y_pred = inverse_scale_targets(scaled_predictions, target_scaler)
+    y_true = inverse_scale_targets(scaled_truth, target_scaler)
+
+    rmse, mae = compute_overall_metrics(y_true, y_pred)
+    print(f"Site {site_id}: validation RMSE={rmse:.4f}, MAE={mae:.4f}")
+
+    best_model_path = site_model_dir / "best_model.pt"
+    torch.save(
+        {
+            "model_state_dict": best_model.state_dict(),
+            "site_id": site_id,
+            "lag_cols": lag_cols,
+            "target_cols": target_cols,
+            "static_feature_cols": static_feature_cols,
+            "lag_scaler_mean": lag_scaler.mean_.tolist(),
+            "lag_scaler_scale": lag_scaler.scale_.tolist(),
+            "static_scaler_mean": static_scaler.mean_.tolist(),
+            "static_scaler_scale": static_scaler.scale_.tolist(),
+            "target_scaler_mean": target_scaler.mean_.tolist(),
+            "target_scaler_scale": target_scaler.scale_.tolist(),
+            "model_hparams": best_model.hparams,
+            "validation_start": str(validation_start),
+            "validation_end": str(validation_end),
+        },
+        best_model_path,
+    )
+    print(f"Site {site_id}: saved best model bundle to {best_model_path}")
+
+    expanded_predictions = expand_predictions_by_target_timestamp(
+        site_id=site_id,
+        valid_df=valid_df,
+        target_cols=target_cols,
+        y_true=y_true,
+        y_pred=y_pred,
+    )
+
+    run_summary = {
+        "site_id": site_id,
+        "train_rows": int(len(train_df)),
+        "validation_rows": int(len(valid_df)),
+        "validation_start": str(validation_start),
+        "validation_end": str(validation_end),
+        "rmse": rmse,
+        "mae": mae,
+        "best_checkpoint": best_ckpt_path,
+        "best_model_path": str(best_model_path),
+    }
+    (site_model_dir / "run_summary.json").write_text(json.dumps(run_summary, indent=2) + "\n")
+
+    return expanded_predictions, run_summary
+
+
+def main() -> None:
+    args = parse_args()
+    set_global_seed(args.seed)
+
+    output_root = Path(args.output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    print("Starting temporal transformer training pipeline")
+    print(f"Parquet pattern: {args.parquet_pattern}")
+    print(f"Output root: {output_root}")
+
+    df = load_parquet_frames(args.parquet_pattern)
+    df = parse_timestamp_columns(df)
+    df = deduplicate_site_rows(df)
+
+    if "site_id" not in df.columns:
+        raise ValueError("Expected parquet data to contain a site_id column.")
+
+    all_expanded_predictions = []
+    overall_rows = []
+
+    for site_id, site_df in df.groupby("site_id", sort=True):
+        site_df = site_df.sort_values("forecast_start_time").reset_index(drop=True)
+        expanded_predictions, run_summary = train_one_site(site_df, args, output_root)
+        all_expanded_predictions.append(expanded_predictions)
+        overall_rows.append(run_summary)
+
+    combined_predictions = pd.concat(all_expanded_predictions, ignore_index=True)
+    metrics_by_season = aggregate_season_metrics(combined_predictions)
+    metrics_path = output_root / "metrics_by_season.csv"
+    metrics_by_season.to_csv(metrics_path, index=False)
+    print(f"Saved seasonal metrics to {metrics_path}")
+
+    overall_metrics_path = output_root / "overall_validation_metrics.csv"
+    pd.DataFrame(overall_rows).to_csv(overall_metrics_path, index=False)
+    print(f"Saved overall validation metrics to {overall_metrics_path}")
+
+    expanded_predictions_path = output_root / "validation_predictions_long.csv"
+    combined_predictions.to_csv(expanded_predictions_path, index=False)
+    print(f"Saved validation predictions to {expanded_predictions_path}")
+
+
+if __name__ == "__main__":
+    main()
