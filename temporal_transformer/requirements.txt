@@ -1,14 +1,26 @@
+# Core data
 pandas
 numpy
 pyarrow
+scipy
+
+# Machine learning
 scikit-learn
 torch
 pytorch-lightning
-psycopg2-binary
-matplotlib
 xgboost
+
+# Database
+psycopg2-binary
+sqlalchemy
+
+# Visualisation
+matplotlib
 seaborn
-scipy
+
+# Utilities
 tqdm
+
+# Jupyter
 ipykernel
 notebook
