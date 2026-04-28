@@ -331,23 +331,28 @@ ORDER BY horizon;
 "
 ```
 
-## Inference Demo Notebook
+### Inference Demo Notebooks
 
-The demo notebook is:
+### `demo2.ipynb` — recommended demo (requires inference.py running separately)
 
-- `demo.ipynb`
+This is the primary demo. Start `inference.py --mode listen` in a terminal
+first (see **Quick Start** above), then run all cells:
 
-The notebook demonstrates the full trigger-style flow:
+1. Finds the latest datastream row for Site 1 AirTemp, Site 3 Discharge, Site 4 Discharge.
+2. Deletes all rows at that exact timestamp (clears duplicates from prior runs).
+3. Re-inserts the same row — the PostgreSQL `AFTER INSERT` trigger fires
+   `pg_notify`, inference.py receives it, runs the season-specific model,
+   and writes 72 prediction rows (3 sites × 24 horizons) to `model_predictions`.
+4. Polls `model_predictions` every 3 seconds until all predictions arrive.
+5. Displays the prediction table and plots 72-hour history + 24-hour forecast.
+6. Deletes the test datastream rows and their predictions.
 
-1. Load season-specific models through `inference.py`.
-2. Find the latest observation for each modeled target site/variable.
-3. Insert one hypothetical exact-hour row per combo using the same latest value.
-   Example: latest `03:45`, value `70` -> hypothetical `04:00`, value `70`.
-4. Drain the PostgreSQL notification queue.
-5. Call `inference.process_event(...)`.
-6. Read predictions from `model_predictions`.
-7. Plot recent hourly history plus the 24-hour forecast.
-8. Delete the hypothetical `datastream` rows and their generated predictions.
+### `demo.ipynb` — self-contained demo (no external inference.py needed)
+
+1. Calls `inference.process_event` internally so no separate terminal is required.
+2. Useful for a quick offline walkthrough of the inference code path.
+3. Plot recent hourly history plus the 24-hour forecast.
+4. Delete the hypothetical `datastream` rows and their generated predictions.
 
 ## Main Files
 
@@ -374,10 +379,9 @@ The notebook demonstrates the full trigger-style flow:
 - `inference.py`
   - Live inference worker and utility functions.
 - `demo.ipynb`
-  - Step-by-step inference demonstration notebook.
-- `database_er_diagram.png`
-  - Rendered database entity relationship diagram.
-
+   - Self-contained inference demo (runs `process_event` internally, no separate process needed).
+- `demo2.ipynb`
+  - Recommended live demo — inserts rows, triggers inference.py running in a terminal, polls and plots predictions.
 ## Saved Outputs
 
 Model artifacts:
