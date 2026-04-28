@@ -19,8 +19,8 @@ from scratch.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/10sajan10/CS6994FinalProject.git
-cd CS6994FinalProject
+git clone https://github.com/10sajan10/SensorstoForecast.git
+cd SensorstoForecast
 ```
 
 ### 2. Set up the Python environment
@@ -439,7 +439,7 @@ Live inference output is stored in the database table `model_predictions`.
 ## Project Structure
 
 ```text
-CS6994FinalProject/
+SensorstoForecast/
 +-- README.md
 +-- Dockerfile
 +-- docker-compose.yml
