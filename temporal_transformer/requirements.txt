@@ -6,3 +6,9 @@ torch
 pytorch-lightning
 psycopg2-binary
 matplotlib
+xgboost
+seaborn
+scipy
+tqdm
+ipykernel
+notebook
